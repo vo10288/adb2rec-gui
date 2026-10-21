@@ -1,0 +1,840 @@
+#!/opt/virtualenv/computer_vision/bin/python3
+
+# by Antonio 'Visi@n' Broi - antonio@tsurugi-linux.org
+# https://tsurugi-linux.org
+# Version 0.7 Beta Integrated - Video and Internal Audio Recording
+# 20261021
+
+# LICENSE M.I.T. https://opensource.org/licenses/MIT
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
+# WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS
+# OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+# OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE
+
+import sys
+from datetime import datetime
+from os import listdir, makedirs, remove, rename
+from os.path import isdir, join, isfile, splitext, exists, expanduser
+import tkinter as tk
+from tkinter import messagebox, ttk
+import os
+import subprocess
+import signal
+import time
+import socket
+import argparse
+import locale
+import threading
+import queue
+from pathlib import Path
+import glob
+import shutil
+import hashlib
+
+os.environ["PYTHONIOENCODING"] = "utf-8" 
+myLocale = locale.setlocale(category=locale.LC_ALL, locale="") 
+
+# Global variables to manage the thread
+screenshot_thread = None
+screenrecord_thread = None
+stop_screenshot = threading.Event()
+stop_screenrecord = threading.Event()
+
+class VideoRepairTool:
+    """Function to fix any potential corruped videos by ADB screenrecord"""
+    
+    @staticmethod
+    def repair_single_video(video_path, output_path=None):
+        """Fix a single video using FFmpeg"""
+        try:
+            path_obj = Path(video_path)
+            if output_path is None:
+                output_path = path_obj.parent / f"{path_obj.stem}_fixed{path_obj.suffix}"
+            
+            cmd = [
+                'ffmpeg', '-hide_banner', '-loglevel', 'error',
+                '-fflags', '+discardcorrupt+genpts+fastseek',
+                '-flags', '+global_header',
+                '-i', str(video_path),
+                '-map', '0:v:0', '-map', '0:a?',
+                '-c:a', 'aac', '-b:a', '192k',
+                '-c:v', 'libx264',
+                '-preset', 'fast',
+                '-crf', '23',
+                '-movflags', '+faststart',
+                '-avoid_negative_ts', 'make_zero',
+                '-pix_fmt', 'yuv420p',
+                '-y', str(output_path)
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            
+            if result.returncode == 0 and Path(output_path).exists():
+                if Path(output_path).stat().st_size > 1024:  # Valid file
+                    return True, str(output_path)
+                else:
+                    Path(output_path).unlink(missing_ok=True)
+                    return False, "Empty fixed file"
+            else:
+                return False, result.stderr
+                
+        except Exception as e:
+            return False, str(e)
+    
+    @staticmethod
+    def optimize_for_ocr(video_path, output_path=None):
+        """Video enhancement for OCR analysis"""
+        try:
+            path_obj = Path(video_path)
+            if output_path is None:
+                output_path = path_obj.parent / f"{path_obj.stem}_ocr{path_obj.suffix}"
+            
+            cmd = [
+                'ffmpeg', '-hide_banner', '-loglevel', 'error',
+                '-i', str(video_path),
+                '-vf', 'scale=-2:720',  # resize keeping aspect ratio
+                '-map', '0:v:0', '-map', '0:a?',
+                '-c:a', 'aac', '-b:a', '192k',
+                '-c:v', 'libx264',
+                '-preset', 'medium',
+                '-crf', '18',  # high quality for OCR
+                '-pix_fmt', 'yuv420p',
+                '-r', '10',  # reduce fps for OCR
+                '-movflags', '+faststart',
+                '-y', str(output_path)
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            
+            if result.returncode == 0:
+                return True, str(output_path)
+            else:
+                return False, result.stderr
+                
+        except Exception as e:
+            return False, str(e)
+
+class AdbMobileForensic:
+    def __init__(self):
+        self.base_directory = expanduser("~/02.computer_vision/04.video2ocr")
+        self.setup_directories()
+        self.current_screenshot_dir = None
+        self.current_screenrecord_dir = None
+        self.video_repair_tool = VideoRepairTool()
+        
+    def setup_directories(self):
+        """Create the directories if not presents"""
+        directories = ['screenshot', 'screenrecord', 'compressfiles', 'hashfiles', 'repaired_videos']
+        for dir_name in directories:
+            dir_path = join(self.base_directory, dir_name)
+            if not exists(dir_path):
+                makedirs(dir_path)
+                
+    def get_timestamp(self):
+        """Get timestamp in the following format YYYYMMDDHHMMss"""
+        return datetime.now().strftime("%Y%m%d%H%M%S")
+    
+    def run_adb_command(self, command):
+        """Execute adb command and returns the result"""
+        try:
+            result = subprocess.run(command, shell=True, capture_output=True, text=True)
+            return result.returncode == 0, result.stdout, result.stderr
+        except Exception as e:
+            return False, "", str(e)
+    
+    def is_device_connected(self):
+        """Verify if and Android device is connected"""
+        success, stdout, _ = self.run_adb_command("adb devices -l")
+        if success and ("device usb" in stdout or "device product" in stdout):
+            return True
+        return False
+    
+    def screenshot_worker(self, mode=None):
+        """Worker thread for the screenshots"""
+        timestamp = self.get_timestamp()
+        self.current_screenshot_dir = join(self.base_directory, "screenshot", timestamp)
+        makedirs(self.current_screenshot_dir)
+        
+        x = 1
+        print(f"Screenshot started. Press 'Stop Screenshot' to quit")
+        print(f"Working directory: {self.current_screenshot_dir}")
+        
+        while not stop_screenshot.is_set() and x < 1000000000:
+            # Take screenshot
+            screenshot_path = join(self.current_screenshot_dir, f"{x}.png")
+            success, _, _ = self.run_adb_command(f"adb exec-out screencap -p > '{screenshot_path}'")
+            
+            if success:
+                print(f"Screenshot saved: {screenshot_path}")
+                
+                # Manage swipe if requested
+                if mode == 'up':
+                    self.run_adb_command("adb shell input touchscreen swipe 300 300 500 1000")
+                elif mode == 'down':
+                    self.run_adb_command("adb shell input touchscreen swipe 500 800 300 300")
+                
+                # Copy temporary files
+                temp_path = join(self.base_directory, "temp.png")
+                temp1_path = join(self.base_directory, "temp1.png")
+                subprocess.run(f"cp '{screenshot_path}' '{temp_path}'", shell=True)
+                subprocess.run(f"cp '{temp_path}' '{temp1_path}'", shell=True)
+            else:
+                print(f"Failed to capture screenshot {x}")
+            
+            x += 1
+            time.sleep(0.1)  # Small pause between each screenshot
+        
+        print("Screenshot stopped")
+    
+    def get_scrcpy_binary(self):
+        """Prefer the configured or portable scrcpy over the old system package."""
+        configured = os.environ.get("SCRCPY_BINARY")
+        if configured:
+            candidate = shutil.which(expanduser(configured))
+            if not candidate:
+                raise RuntimeError("SCRCPY_BINARY does not point to an executable")
+            return candidate
+        candidates = sorted(
+            Path(expanduser("~")).glob("scrcpy-linux-x86_64-v*/scrcpy"),
+            key=lambda p: p.stat().st_mtime, reverse=True
+        )
+        for candidate in candidates:
+            if os.access(candidate, os.X_OK):
+                return str(candidate.resolve())
+        candidate = shutil.which("scrcpy")
+        if not candidate:
+            raise RuntimeError("scrcpy not found. Set SCRCPY_BINARY to the new executable.")
+        return candidate
+
+    def screenrecord_worker(self):
+        """Record video and internal audio in 180-second segments, then repair."""
+        try:
+            scrcpy_binary = self.get_scrcpy_binary()
+            check = subprocess.run([scrcpy_binary, "--help"], capture_output=True,
+                                   text=True, timeout=10)
+            required = ("--require-audio", "--time-limit")
+            if check.returncode or any(flag not in check.stdout for flag in required):
+                raise RuntimeError("scrcpy is too old. Set SCRCPY_BINARY to the updated version.")
+        except Exception as e:
+            print(f"Cannot start audio/video recording: {e}")
+            return
+
+        timestamp = self.get_timestamp()
+        self.current_screenrecord_dir = join(self.base_directory, "screenrecord", timestamp)
+        makedirs(self.current_screenrecord_dir)
+        x = 1
+        print("Screen and INTERNAL AUDIO recording started. Press 'Stop Screen Record' to quit")
+        print(f"Working directory: {self.current_screenrecord_dir}")
+        print(f"Using scrcpy: {scrcpy_binary}")
+
+        while not stop_screenrecord.is_set() and x < 1000000000:
+            temp_local_path = join(self.current_screenrecord_dir, f"temp_{x}.mp4")
+            final_local_path = join(self.current_screenrecord_dir, f"{x}.mp4")
+            original_local_path = join(self.current_screenrecord_dir, f"original_{x}.mp4")
+            record_command = [
+                scrcpy_binary, "--record=" + temp_local_path,
+                "--video-bit-rate=4M", "--video-codec=h264",
+                "--audio-source=output", "--audio-codec=aac", "--require-audio",
+                "--time-limit=180", "--no-control"
+            ]
+            print(f"Starting recording {x} (video + internal audio)...")
+            record_process = None
+            try:
+                # A log file avoids undrained PIPEs and retains scrcpy diagnostics.
+                log_path = join(self.current_screenrecord_dir, f"scrcpy_{x}.log")
+                with open(log_path, "w", encoding="utf-8") as log_file:
+                    record_process = subprocess.Popen(
+                        record_command, stdout=log_file, stderr=subprocess.STDOUT
+                    )
+                    try:
+                        while record_process.poll() is None:
+                            if stop_screenrecord.wait(0.2):
+                                print("Stop requested, finalizing recording...")
+                                break
+                    finally:
+                        if record_process.poll() is None:
+                            record_process.send_signal(signal.SIGINT)
+                            try:
+                                record_process.wait(timeout=15)
+                            except subprocess.TimeoutExpired:
+                                record_process.terminate()
+                                try:
+                                    record_process.wait(timeout=5)
+                                except subprocess.TimeoutExpired:
+                                    record_process.kill()
+                                    record_process.wait()
+                success = (record_process.returncode == 0 and isfile(temp_local_path)
+                           and os.path.getsize(temp_local_path) > 1024)
+                stderr = f"scrcpy exit code {record_process.returncode}; see {log_path}"
+            except Exception as e:
+                success, stderr = False, str(e)
+
+            if success and isfile(temp_local_path):
+                # Preserve the raw scrcpy output before any FFmpeg transformation.
+                # Always retain the source video, even when repair fails.
+                try:
+                    os.replace(temp_local_path, original_local_path)
+                except OSError as exc:
+                    print(f"Could not preserve original recording: {exc}")
+                    break
+                print(f"Original recording preserved: {original_local_path}")
+                # Fix video with FFmpeg
+                print(f"Repairing video {x}...")
+                repair_success, repair_result = self.video_repair_tool.repair_single_video(
+                    original_local_path, final_local_path
+                )
+                
+                if repair_success:
+                    print(f"✅ Video {x} recorded and repaired: {final_local_path}")
+                else:
+                    print(f"⚠️ Video repairing failed for {x}: {repair_result}")
+                    print(f"   Original retained: {original_local_path}")
+                
+            else:
+                print(f"❌ Failed to record video {x}: {stderr}")
+                print("Any partial file is retained. Recording stopped.")
+                break
+            
+            if stop_screenrecord.is_set():
+                break
+            
+            x += 1
+        
+        print("Screen recording stopped")
+    
+    def repair_existing_videos(self):
+        """Repair all the existent videosin the screenrecord directory"""
+        def repair_worker():
+            print("🔧 Start repairing existent videos...")
+            
+            # Fin all mp4 videos in the screenrecord directory
+            pattern = join(self.base_directory, "screenrecord", "**/*.mp4")
+            video_files = glob.glob(pattern, recursive=True)
+            
+            if not video_files:
+                messagebox.showinfo("Info", "No MP4 videos found to repair")
+                return
+            
+            print(f"Found {len(video_files)} video to repair")
+            
+            repaired_count = 0
+            repair_dir = join(self.base_directory, "repaired_videos", self.get_timestamp())
+            makedirs(repair_dir)
+            
+            for i, video_file in enumerate(video_files, 1):
+                print(f"📹 Video repairing {i}/{len(video_files)}: {video_file}")
+                
+                # File name repaired
+                video_name = Path(video_file).name
+                repaired_path = join(repair_dir, f"repaired_{video_name}")
+                
+                # Repair video
+                success, result = self.video_repair_tool.repair_single_video(video_file, repaired_path)
+                
+                if success:
+                    print(f"✅ Repaired: {repaired_path}")
+                    repaired_count += 1
+                    
+                    # Optimize for OCR if requested
+                    ocr_path = join(repair_dir, f"ocr_{video_name}")
+                    ocr_success, ocr_result = self.video_repair_tool.optimize_for_ocr(repaired_path, ocr_path)
+                    
+                    if ocr_success:
+                        print(f"📊 Optimized for OCR: {ocr_path}")
+                else:
+                    print(f"❌ Repairing error: {result}")
+            
+            message = f"Repair completed!\n\n"
+            message += f"Repaired videos: {repaired_count}/{len(video_files)}\n"
+            message += f"Directory output: {repair_dir}"
+            
+            messagebox.showinfo("Repair completed", message)
+            print(f"🎉 Repair completed: {repaired_count}/{len(video_files)} repaired videos")
+        
+        # Start thread to avoid blocking the GUI
+        repair_thread = threading.Thread(target=repair_worker)
+        repair_thread.daemon = True
+        repair_thread.start()
+
+# Global instance
+forensic_tool = AdbMobileForensic()
+
+def print_banner():
+    """Print banner"""
+    command = "jp2a /usr/share/icons/tsurugi/tsurugi.jpg 2>/dev/null || echo 'Tsurugi Linux Mobile Forensic Tool v0.6 Beta'"
+    subprocess.run(command, shell=True)
+
+def helpme():
+    """Show help information"""
+    help_text = """HELP:
+
+1. DEVICE CONNECTION:
+   - Connect the cable to the device
+   - Enable developer mode
+   - Enable USB debug feature
+   - Click 'ADB CONNECT CABLE MOBILE FOR WIFI'
+
+2. SETUP WIFI CONNECTION (optional):
+   - After cable setup, disconnect USB
+   - Clicca 'ADB CONNECT LOCAL MOBILE IP WIFI'
+   - Set the device IP address
+
+3. ACQUISITION:
+   - SCREENSHOT: continuous capture
+   - SCREENSHOT UP/DOWN: with automatic swipe
+   - SCREEN RECORD: video + internal audio recording via updated scrcpy (auto-repaired)
+
+4. VIDEO REPAIRING:
+   - 'REPAIR EXISTING VIDEOS': repair corrupted videos
+   - Build optimized versions for OCR analysis
+
+5. FINAL TASKS:
+   - 'COMPRESS FILES AND CALCULATE HASH': archive everything
+"""
+    
+    messagebox.showinfo("Help", help_text)
+
+def adb_connect_cable():
+    """Device connection via cable to setup the WiFi"""
+    print("You have chosen ADB Connect cable, please wait...")
+    
+    success, stdout, _ = forensic_tool.run_adb_command("adb devices -l")
+    if success:
+        print(stdout)
+    
+    success, _, _ = forensic_tool.run_adb_command("adb tcpip 7777")
+    if success:
+        time.sleep(3)
+        print("Now it's possible to disconnect the cable from the Mobile Phone and use the wifi network")
+        messagebox.showinfo("Success", "Device configured for WiFi connection.\nYou can now disconnect the cable.")
+    else:
+        messagebox.showerror("Error", "Failed to configure device for WiFi")
+
+def adb_connect_ip_wifi():
+    """Device connection using WiFi"""
+    print("You have chosen ADB Connect wifi, please wait...")
+    print("Now connect the Mobile Phone to the wifi network and get the IP address")
+    
+    # Create window to get IP address information
+    dialog = tk.Toplevel()
+    dialog.title("Enter IP Address")
+    dialog.geometry("350x150")
+    dialog.transient()
+    dialog.grab_set()
+    
+    tk.Label(dialog, text="Enter device IP (e.g., 192.168.1.100):").pack(pady=10)
+    ip_entry = tk.Entry(dialog, width=20, font=("Arial", 12))
+    ip_entry.pack(pady=5)
+    ip_entry.focus()
+    
+    def connect_ip():
+        ip = ip_entry.get().strip()
+        if not ip:
+            messagebox.showerror("Error", "Please enter an IP address")
+            return
+            
+        try:
+            socket.inet_aton(ip)
+            print(f"Valid IP: {ip}")
+            success, stdout, stderr = forensic_tool.run_adb_command(f"adb connect {ip}:7777")
+            if success:
+                print(f"Connected to {ip}:7777")
+                messagebox.showinfo("Success", f"Connected to {ip}:7777")
+                dialog.destroy()
+            else:
+                messagebox.showerror("Error", f"Failed to connect to {ip}:7777\n{stderr}")
+        except socket.error:
+            messagebox.showerror("Error", "Invalid IP address format")
+    
+    button_frame = tk.Frame(dialog)
+    button_frame.pack(pady=10)
+    
+    tk.Button(button_frame, text="Connect", command=connect_ip, bg="#1919EE", fg="white").pack(side=tk.LEFT, padx=5)
+    tk.Button(button_frame, text="Cancel", command=dialog.destroy, bg="#888888", fg="white").pack(side=tk.LEFT, padx=5)
+    
+    # Bind Enter key
+    ip_entry.bind('<Return>', lambda e: connect_ip())
+
+def screenshot():
+    """Start continous screenshot activity"""
+    global screenshot_thread, stop_screenshot
+    
+    if not forensic_tool.is_device_connected():
+        messagebox.showwarning("Warning", "No device connected!")
+        return
+    
+    if screenshot_thread and screenshot_thread.is_alive():
+        messagebox.showwarning("Warning", "Screenshot already running!")
+        return
+    
+    stop_screenshot.clear()
+    screenshot_thread = threading.Thread(target=forensic_tool.screenshot_worker)
+    screenshot_thread.daemon = True
+    screenshot_thread.start()
+
+def screenshot_up():
+    """Start screenshot with swipe up"""
+    global screenshot_thread, stop_screenshot
+    
+    if not forensic_tool.is_device_connected():
+        messagebox.showwarning("Warning", "No device connected!")
+        return
+    
+    if screenshot_thread and screenshot_thread.is_alive():
+        messagebox.showwarning("Warning", "Screenshot already running!")
+        return
+    
+    stop_screenshot.clear()
+    screenshot_thread = threading.Thread(target=forensic_tool.screenshot_worker, args=('up',))
+    screenshot_thread.daemon = True
+    screenshot_thread.start()
+
+def screenshot_down():
+    """Start screenshot with swipe down"""
+    global screenshot_thread, stop_screenshot
+    
+    if not forensic_tool.is_device_connected():
+        messagebox.showwarning("Warning", "No device connected!")
+        return
+    
+    if screenshot_thread and screenshot_thread.is_alive():
+        messagebox.showwarning("Warning", "Screenshot already running!")
+        return
+    
+    stop_screenshot.clear()
+    screenshot_thread = threading.Thread(target=forensic_tool.screenshot_worker, args=('down',))
+    screenshot_thread.daemon = True
+    screenshot_thread.start()
+
+def killscreenshot():
+    """Stop screenshot activity"""
+    global stop_screenshot
+    stop_screenshot.set()
+    print("Stopping screenshot...")
+
+def screenrecord():
+    """Start screen recording"""
+    global screenrecord_thread, stop_screenrecord
+    
+    if not forensic_tool.is_device_connected():
+        messagebox.showwarning("Warning", "No device connected!")
+        return
+    
+    if screenrecord_thread and screenrecord_thread.is_alive():
+        messagebox.showwarning("Warning", "Screen recording already running!")
+        return
+    
+    stop_screenrecord.clear()
+    screenrecord_thread = threading.Thread(target=forensic_tool.screenrecord_worker)
+    screenrecord_thread.daemon = True
+    screenrecord_thread.start()
+
+def killscreenrecord():
+    """Stop screen recording"""
+    global stop_screenrecord
+    stop_screenrecord.set()
+    print("Stopping screen recording...")
+
+def repair_existing_videos():
+    """Repair existent videos"""
+    forensic_tool.repair_existing_videos()
+
+def create_sha256_manifest(base_directory):
+    """Hash source and derived acquisition files; never modify the evidence files."""
+    root = Path(base_directory)
+    manifest = root / "hashfiles" / "SHA256SUMS.txt"
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    target_dirs = ("screenshot", "screenrecord", "repaired_videos")
+    entries = []
+    for dirname in target_dirs:
+        folder = root / dirname
+        if not folder.is_dir():
+            continue
+        for path in sorted(folder.rglob("*")):
+            if not path.is_file():
+                continue
+            digest = hashlib.sha256()
+            with path.open("rb") as source:
+                for block in iter(lambda: source.read(1024 * 1024), b""):
+                    digest.update(block)
+            relative = path.relative_to(root).as_posix()
+            # sha256sum-compatible format, with escaping for newlines/backslashes.
+            if "\\" in relative or "\n" in relative:
+                escaped = relative.replace("\\", "\\\\").replace("\n", "\\n")
+                entries.append(f"\\{digest.hexdigest()}  {escaped}")
+            else:
+                entries.append(f"{digest.hexdigest()}  {relative}")
+    # Rewrite rather than append to avoid duplicate/outdated checksum rows.
+    manifest.write_text("\n".join(entries) + ("\n" if entries else ""), encoding="utf-8")
+    return manifest, len(entries)
+
+
+def compressandhash():
+    """Start file hashing and compression"""
+    def compress_and_hash_worker():
+        os.chdir(forensic_tool.base_directory)
+        
+        print("Starting compression and hash calculation...")
+        try:
+            manifest, count = create_sha256_manifest(forensic_tool.base_directory)
+            print(f"SHA-256 manifest written: {manifest} ({count} individual files)")
+        except Exception as exc:
+            print(f"Individual SHA-256 manifest generation failed: {exc}")
+            messagebox.showerror("Hash error", f"Could not create SHA-256 manifest: {exc}")
+            return
+        
+        # Compress screenshot
+        print("Compressing screenshots...")
+        success, _, _ = forensic_tool.run_adb_command(
+            'tar -czf compressfiles/screenshot.tar.gz screenshot/'
+        )
+        if not success:
+            print("Failed to compress screenshots")
+            return
+        
+        # Compress screenrecord
+        print("Compressing screen recordings...")
+        success, _, _ = forensic_tool.run_adb_command(
+            'tar -czf compressfiles/screenrecord.tar.gz screenrecord/'
+        )
+        if not success:
+            print("Failed to compress screen recordings")
+            return
+        
+        # Compress repaired videos if they exist
+        if exists(join(forensic_tool.base_directory, "repaired_videos")):
+            print("Compressing repaired videos...")
+            forensic_tool.run_adb_command(
+                'tar -czf compressfiles/repaired_videos.tar.gz repaired_videos/'
+            )
+        
+        print("Compression completed. Calculating hashes...")
+        
+        # Files hashing for screenshots
+        print("Calculating hashes for screenshots...")
+        forensic_tool.run_adb_command(
+            'md5sum compressfiles/screenshot.tar.gz >> hashfiles/hash_screenshot.txt'
+        )
+        forensic_tool.run_adb_command(
+            'sha256sum compressfiles/screenshot.tar.gz >> hashfiles/hash_screenshot.txt'
+        )
+        
+        # Files hashing for screenrecord
+        print("Calculating hashes for screen recordings...")
+        forensic_tool.run_adb_command(
+            'md5sum compressfiles/screenrecord.tar.gz >> hashfiles/hash_screenrecord.txt'
+        )
+        forensic_tool.run_adb_command(
+            'sha256sum compressfiles/screenrecord.tar.gz >> hashfiles/hash_screenrecord.txt'
+        )
+        
+        # Hash repaired videos if they exist
+        if isfile(join(forensic_tool.base_directory, "compressfiles/repaired_videos.tar.gz")):
+            print("Calculating hashes for repaired videos...")
+            forensic_tool.run_adb_command(
+                'md5sum compressfiles/repaired_videos.tar.gz >> hashfiles/hash_repaired_videos.txt'
+            )
+            forensic_tool.run_adb_command(
+                'sha256sum compressfiles/repaired_videos.tar.gz >> hashfiles/hash_repaired_videos.txt'
+            )
+        
+        # Get Android ID and organize files
+        success, android_id, _ = forensic_tool.run_adb_command(
+            "adb shell settings get secure android_id"
+        )
+        if success and android_id.strip():
+            android_id = android_id.strip()
+            android_dir = join(forensic_tool.base_directory, android_id)
+            
+            if not exists(android_dir):
+                makedirs(android_dir)
+            
+            # Move all the files in the device directory
+            commands = [
+                f"mv compressfiles/* '{android_dir}/' 2>/dev/null",
+                f"mv hashfiles/* '{android_dir}/' 2>/dev/null",
+                f"mv screenshot/ '{android_dir}/' 2>/dev/null",
+                f"mv screenrecord/ '{android_dir}/' 2>/dev/null",
+                f"mv repaired_videos/ '{android_dir}/' 2>/dev/null",
+                f"mv temp*.png '{android_dir}/' 2>/dev/null"
+            ]
+            
+            for cmd in commands:
+                subprocess.run(cmd, shell=True)
+            
+            print(f"All files organized in directory: {android_dir}")
+            messagebox.showinfo("Success", f"Compression and hash calculation completed!\nFiles saved in: {android_dir}")
+        else:
+            messagebox.showinfo("Success", "Compression and hash calculation completed!")
+    
+    # Start new thread to preserve the GUI running
+    compress_thread = threading.Thread(target=compress_and_hash_worker)
+    compress_thread.daemon = True
+    compress_thread.start()
+
+def main():
+    """Main function"""
+    # Parse arguments
+    ap = argparse.ArgumentParser()
+    ap.add_argument("-d", "--daemon", default="d",
+        help="Daemon mode")
+    ap.add_argument("-1", "--lang1", default="en",
+        help="First language, default en")
+    ap.add_argument("-2", "--lang2", default="fr",
+        help="Second language, default fr")
+    ap.add_argument("-3", "--lang3", default="it",
+        help="Third language, default it")
+    ap.add_argument("-4", "--lang4", default="es",
+        help="Fourth language, default es")
+    ap.add_argument("-t", "--time", default=int(3),
+        help="Time between languages in seconds")
+    
+    args = vars(ap.parse_args())
+    
+    # Print banner
+    print_banner()
+    
+    # Create GUI
+    root = tk.Tk()
+    root.wm_title("Adb2rec-gui Mobile Forensic v0.6 Beta - Enhanced Video Support")
+    root.geometry("400x600")
+    root.configure(bg="#f0f0f0")
+    
+    # Main frame with scrollbar
+    main_frame = tk.Frame(root, bg="#f0f0f0")
+    main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+    
+    # Title
+    title_label = tk.Label(
+        main_frame,
+        text="ADB Mobile Forensic Tool",
+        font=("Arial", 16, "bold"),
+        bg="#f0f0f0",
+        fg="#333333"
+    )
+    title_label.pack(pady=(0, 20))
+    
+    # Connection section
+    conn_frame = tk.LabelFrame(main_frame, text="Connection", font=("Arial", 12, "bold"), bg="#f0f0f0")
+    conn_frame.pack(fill=tk.X, pady=(0, 10))
+    
+    connection_buttons = [
+        ("ADB CONNECT CABLE", "#1919EE", adb_connect_cable),
+        ("ADB CONNECT WIFI", "#1919EE", adb_connect_ip_wifi),
+    ]
+    
+    for text, bg_color, command in connection_buttons:
+        btn = tk.Button(
+            conn_frame,
+            text=text,
+            fg="#FFFFFF",
+            bg=bg_color,
+            font=("Arial", 10, "bold"),
+            command=command,
+            relief=tk.RAISED,
+            bd=2
+        )
+        btn.pack(fill=tk.X, padx=5, pady=2)
+    
+    # Screenshot section
+    screenshot_frame = tk.LabelFrame(main_frame, text="Screenshot", font=("Arial", 12, "bold"), bg="#f0f0f0")
+    screenshot_frame.pack(fill=tk.X, pady=(0, 10))
+    
+    screenshot_buttons = [
+        ("SCREENSHOT", "#191988", screenshot),
+        ("SCREENSHOT UP", "#191988", screenshot_up),
+        ("SCREENSHOT DOWN", "#191988", screenshot_down),
+        ("STOP SCREENSHOT", "#cc0000", killscreenshot),
+    ]
+    
+    for text, bg_color, command in screenshot_buttons:
+        btn = tk.Button(
+            screenshot_frame,
+            text=text,
+            fg="#FFFFFF",
+            bg=bg_color,
+            font=("Arial", 10, "bold"),
+            command=command,
+            relief=tk.RAISED,
+            bd=2
+        )
+        btn.pack(fill=tk.X, padx=5, pady=2)
+    
+    # Video recording section
+    video_frame = tk.LabelFrame(main_frame, text="Video Recording", font=("Arial", 12, "bold"), bg="#f0f0f0")
+    video_frame.pack(fill=tk.X, pady=(0, 10))
+    
+    video_buttons = [
+        ("SCREEN RECORD", "#191922", screenrecord),
+        ("STOP SCREEN RECORD", "#cc0000", killscreenrecord),
+        ("REPAIR EXISTING VIDEOS", "#6960EC", repair_existing_videos),
+    ]
+    
+    for text, bg_color, command in video_buttons:
+        btn = tk.Button(
+            video_frame,
+            text=text,
+            fg="#FFFFFF",
+            bg=bg_color,
+            font=("Arial", 10, "bold"),
+            command=command,
+            relief=tk.RAISED,
+            bd=2
+        )
+        btn.pack(fill=tk.X, padx=5, pady=2)
+    
+    # Processing section
+    process_frame = tk.LabelFrame(main_frame, text="Processing", font=("Arial", 12, "bold"), bg="#f0f0f0")
+    process_frame.pack(fill=tk.X, pady=(0, 10))
+    
+    process_buttons = [
+        ("COMPRESS FILES AND CALCULATE HASH", "#228B22", compressandhash),
+        ("HELP", "#FF6600", helpme),
+    ]
+    
+    for text, bg_color, command in process_buttons:
+        btn = tk.Button(
+            process_frame,
+            text=text,
+            fg="#FFFFFF",
+            bg=bg_color,
+            font=("Arial", 10, "bold"),
+            command=command,
+            relief=tk.RAISED,
+            bd=2
+        )
+        btn.pack(fill=tk.X, padx=5, pady=2)
+    
+    # Status frame
+    status_frame = tk.Frame(main_frame, bg="#f0f0f0")
+    status_frame.pack(fill=tk.X, pady=(10, 0))
+    
+    # Footer
+    label = tk.Label(
+        status_frame,
+        text="Visi@n - Tsurugi Linux v0.6 Beta\nEnhanced Video Support",
+        fg="blue",
+        bg="#f0f0f0",
+        font=("helvetica", 10),
+        justify=tk.CENTER
+    )
+    label.pack(side=tk.BOTTOM, pady=10)
+    
+    # Manage "closure" functions
+    def on_closing():
+        stop_screenshot.set()
+        stop_screenrecord.set()
+        def finish_close():
+            if screenrecord_thread and screenrecord_thread.is_alive():
+                root.after(100, finish_close)
+            else:
+                root.destroy()
+        finish_close()
+    
+    root.protocol("WM_DELETE_WINDOW", on_closing)
+    
+    # Start GUI
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
