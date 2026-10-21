@@ -1,6 +1,8 @@
 # adb2rec-gui
 
 **Android screen acquisition, video/audio recording and evidence export — a Python/Tkinter GUI for Linux and Tsurugi Linux.**
+<img width="1254" height="1254" alt="Operativo futuristico tra mappe e dati" src="https://github.com/user-attachments/assets/778005a8-5f81-4f2f-8a61-e9bbc03ca7af" />
+
 
 **Author:** Antonio "Visi@n" Broi  
 **Contact:** antonio@tsurugi-linux.org  
